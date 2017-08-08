@@ -24,7 +24,8 @@ Gem::Specification.new do |s|
   s.add_runtime_dependency 'logstash-codec-plain'
   s.add_runtime_dependency 'mail'
   s.add_runtime_dependency 'stud', '~> 0.0.22'
+  s.add_runtime_dependency 'yomu', '~> 0.2.4'
+  s.add_runtime_dependency 'httparty', '~> 0.14.0'
 
   s.add_development_dependency 'logstash-devutils'
 end
-

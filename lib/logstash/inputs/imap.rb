@@ -4,6 +4,7 @@ require "logstash/namespace"
 require "logstash/timestamp"
 require "stud/interval"
 require "socket" # for Socket.gethostname
+require "yomu"
 
 # Read mails from IMAP server
 #
@@ -27,6 +28,8 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
   config :lowercase_headers, :validate => :boolean, :default => true
   config :check_interval, :validate => :number, :default => 300
   config :delete, :validate => :boolean, :default => false
+  config :expunge, :validate => :boolean, :default => false
+  config :strip_attachments, :validate => :boolean, :default => false
 
   # For multipart messages, use the first part that has this
   # content-type as the event message.
@@ -80,10 +83,23 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
       items.each do |item|
         next unless item.attr.has_key?("RFC822")
         mail = Mail.read_from_string(item.attr["RFC822"])
-        queue << parse_mail(mail)
+        if @strip_attachments
+          queue << parse_mail(mail.without_attachments!)
+        else
+          queue << parse_mail(mail)
+        end
       end
 
       imap.store(id_set, '+FLAGS', @delete ? :Deleted : :Seen)
+
+    end
+
+  # Enable an 'expunge' IMAP command after the items.each loop
+    if @expunge
+    # Force messages to be marked as "Deleted", the above may or may not be working as expected. "Seen" means nothing if you are going to
+    # delete a message after processing.
+      imap.store(id_set, '+FLAGS', [:Deleted])
+      imap.expunge()
     end
 
     imap.close
@@ -91,18 +107,23 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
   end
 
   def parse_mail(mail)
+    parsed_attachments = Array.new
+    mail.attachments.each do | attachment |
+      if  ['.pdf', '.doc'].any? { |ext| attachment.filename.include? ext }
+        @logger.warn("Parsing an attachment")
+        mail.attachments.delete(attachment)
+        txt = Yomu.read :text, attachment.body
+        parsed_attachments << txt
+      else
+        @logger.warn("Deleting current attachment, since it is not a pdf file or word document.")
+        mail.attachments.delete(attachment)
+      end
+    end
     # Add a debug message so we can track what message might cause an error later
     @logger.debug? && @logger.debug("Working with message_id", :message_id => mail.message_id)
     # TODO(sissel): What should a multipart message look like as an event?
     # For now, just take the plain-text part and set it as the message.
-    if mail.parts.count == 0
-      # No multipart message, just use the body as the event text
-      message = mail.body.decoded
-    else
-      # Multipart message; use the first text/plain part we find
-      part = mail.parts.find { |p| p.content_type.match @content_type_re } || mail.parts.first
-      message = part.decoded
-    end
+    message = mail.multipart? ? (mail.text_part ? mail.text_part.body.decoded : nil) : mail.body.decoded
 
     @codec.decode(message) do |event|
       # Use the 'Date' field as the timestamp
@@ -121,17 +142,21 @@ class LogStash::Inputs::IMAP < LogStash::Inputs::Base
         # Assume we already processed the 'date' above.
         next if name == "Date"
 
-        case (field = event[name])
+        case (field = event.get(name))
         when String
           # promote string to array if a header appears multiple times
           # (like 'received')
-          event[name] = [field, value]
+          event.set(name, [field, value])
         when Array
           field << value
-          event[name] = field
+          event.set(name, field)
         when nil
-          event[name] = value
+          event.set(name, value)
         end
+      end
+
+      if parsed_attachments.length > 0
+        event.set("attachments", parsed_attachments)
       end
 
       decorate(event)
